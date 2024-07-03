@@ -1,0 +1,42 @@
+import gradio as gr
+import torch
+from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
+from PIL import Image
+import numpy as np
+
+# Charger le modèle et le processeur
+model = SegformerForSemanticSegmentation.from_pretrained("votre/chemin/vers/le/modele")
+processor = SegformerImageProcessor.from_pretrained("nvidia/mit-b0")  # Ajustez si nécessaire
+
+# Fonction pour prédire la segmentation
+def predict_segmentation(image):
+    # Prétraiter l'image
+    inputs = processor(images=image, return_tensors="pt")
+    
+    # Faire la prédiction
+    with torch.no_grad():
+        outputs = model(**inputs)
+        logits = outputs.logits
+    
+    # Post-traiter les résultats
+    seg_map = logits.argmax(dim=1)[0]
+    seg_map = seg_map.cpu().numpy()
+    
+    # Convertir la carte de segmentation en image colorée
+    # Vous devrez ajuster cela en fonction de vos classes spécifiques
+    color_map = np.array([[0, 0, 0], [255, 0, 0], [0, 255, 0], [0, 0, 255]])  # Exemple
+    colored_seg_map = color_map[seg_map]
+    
+    return Image.fromarray(colored_seg_map.astype('uint8'))
+
+# Définir l'interface Gradio
+iface = gr.Interface(
+    fn=predict_segmentation,
+    inputs=gr.Image(type="pil"),
+    outputs=gr.Image(type="pil"),
+    title="Segmentation d'image avec Segformer",
+    description="Téléchargez une image pour obtenir sa segmentation sémantique."
+)
+
+# Lancer l'application
+iface.launch()

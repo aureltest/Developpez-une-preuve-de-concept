@@ -2,41 +2,397 @@ import gradio as gr
 import torch
 from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
 from PIL import Image
+import plotly.graph_objects as go
 import numpy as np
+import os
+import torch.nn as nn
+from sklearn.metrics import jaccard_score, accuracy_score
+from collections import Counter
+import matplotlib.pyplot as plt
+import seaborn as sns
+import torch.nn.functional as F
+import seaborn as sns
+from functools import partial
+from pytorch_grad_cam.utils.image import show_cam_on_image, preprocess_image as grad_preprocess
+from pytorch_grad_cam import GradCAM
+import cv2
+import transformers
+from torchvision import transforms
+import io
 
-# Charger le modèle et le processeur
-model = SegformerForSemanticSegmentation.from_pretrained("votre/chemin/vers/le/modele")
-processor = SegformerImageProcessor.from_pretrained("nvidia/mit-b0")  # Ajustez si nécessaire
+device = "cuda" if torch.cuda.is_available() else "cpu"
+data_folder = "data_sample"
+id2label = {0:'void', 1:'flat', 2:'construction', 3:'object', 4:'nature', 5:'sky', 6:'human', 7:'vehicle'}
+label2id = {v: k for k, v in id2label.items()}
+num_labels= len(id2label)
+checkpoint = "nvidia/segformer-b4-finetuned-cityscapes-1024-1024"
+image_processor = SegformerImageProcessor()
+state_dict_path = f"runs/{checkpoint}_v1/best_model.pt"
+model = SegformerForSemanticSegmentation.from_pretrained(checkpoint, num_labels=num_labels, id2label=id2label, label2id=label2id, ignore_mismatched_sizes=True)
+loaded_state_dict  = torch.load(state_dict_path)
+model.load_state_dict(loaded_state_dict)
+model = model.to(device)
+model.eval()
 
-# Fonction pour prédire la segmentation
-def predict_segmentation(image):
-    # Prétraiter l'image
-    inputs = processor(images=image, return_tensors="pt")
+
+
+def load_and_prepare_images(image_name, segformer=False):
+    image_path = os.path.join(data_folder, "images", image_name)
+    mask_name = image_name.replace("_leftImg8bit.png", "_gtFine_labelIds.png")
+    mask_path = os.path.join(data_folder, "masks", mask_name)
+    fpn_pred_path = os.path.join(data_folder, "resnet101_mask", image_name)
     
-    # Faire la prédiction
-    with torch.no_grad():
-        outputs = model(**inputs)
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image not found: {image_path}")
+    if not os.path.exists(mask_path):
+        raise FileNotFoundError(f"Mask not found: {mask_path}")
+    if not os.path.exists(fpn_pred_path):
+        raise FileNotFoundError(f"FPN prediction not found: {fpn_pred_path}")
+    
+    original_image = Image.open(image_path).convert("RGB")
+    original = original_image.resize((1024, 512))
+    true_mask = np.array(Image.open(mask_path))
+    fpn_pred = np.array(Image.open(fpn_pred_path))
+    if segformer:    
+        segformer_pred = predict_segmentation(original)
+        return original, true_mask, fpn_pred, segformer_pred
+    
+    return original, true_mask, fpn_pred
+
+def predict_segmentation(image):
+    # Charger et préparer l'image
+    inputs = image_processor(images=image, return_tensors="pt")
+    
+    # Utiliser GPU si disponible
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)  
+    
+    # Déplacer les inputs sur le bon device et faire la prédiction
+    pixel_values = inputs.pixel_values.to(device)
+    
+    with torch.no_grad():  # Désactiver le calcul des gradients pour l'inférence
+        outputs = model(pixel_values=pixel_values)
         logits = outputs.logits
     
-    # Post-traiter les résultats
-    seg_map = logits.argmax(dim=1)[0]
-    seg_map = seg_map.cpu().numpy()
+    # Redimensionner les logits à la taille de l'image d'origine
+    upsampled_logits = nn.functional.interpolate(
+        logits,
+        size=image.size[::-1],  # (height, width)
+        mode="bilinear",
+        align_corners=False
+    )
     
-    # Convertir la carte de segmentation en image colorée
-    # Vous devrez ajuster cela en fonction de vos classes spécifiques
-    color_map = np.array([[0, 0, 0], [255, 0, 0], [0, 255, 0], [0, 0, 255]])  # Exemple
-    colored_seg_map = color_map[seg_map]
+    # Obtenir la prédiction finale
+    pred_seg = upsampled_logits.argmax(dim=1)[0].cpu().numpy()
     
-    return Image.fromarray(colored_seg_map.astype('uint8'))
+    return pred_seg
 
-# Définir l'interface Gradio
-iface = gr.Interface(
-    fn=predict_segmentation,
-    inputs=gr.Image(type="pil"),
-    outputs=gr.Image(type="pil"),
-    title="Segmentation d'image avec Segformer",
-    description="Téléchargez une image pour obtenir sa segmentation sémantique."
-)
+
+
+def process_image(image_name):
+    original, true_mask, fpn_pred, segformer_pred = load_and_prepare_images(image_name, segformer=True)
+    true_mask_colored = colorize_mask(true_mask)
+    true_mask_colored = Image.fromarray(true_mask_colored.astype('uint8'))
+    true_mask_colored = true_mask_colored.resize((1024,512))
+    # fpn_pred_colored = colorize_mask(fpn_pred)
+    segformer_pred_colored = colorize_mask(segformer_pred)
+    segformer_pred_colored = Image.fromarray(segformer_pred_colored.astype('uint8'))
+    segformer_pred_colored = segformer_pred_colored.resize((1024,512))
+    
+    return [
+        (original, "Image originale"),
+        (true_mask_colored, "Masque réel"),
+        (fpn_pred, "Prédiction FPN"),
+        (segformer_pred_colored, "Prédiction SegFormer")
+    ]
+
+def create_cityscapes_label_colormap():
+    colormap = np.zeros((256, 3), dtype=np.uint8)
+    colormap[0] = [78,82,110]
+    colormap[1] = [128,64,128]
+    colormap[2] = [154,156,153]
+    colormap[3] = [168,167,18]
+    colormap[4] = [80,108,28]
+    colormap[5] = [112,164,196]
+    colormap[6] = [168,28,52]
+    colormap[7] = [16,18,112]
+    return colormap
+
+# Créer la colormap une fois
+cityscapes_colormap = create_cityscapes_label_colormap()
+
+def blend_images(original_image, colored_segmentation, alpha=0.6):
+    blended_image = Image.blend(original_image, colored_segmentation, alpha)
+    return blended_image
+
+def colorize_mask(mask):
+    return cityscapes_colormap[mask]
+    
+def compare_masks(real_mask, fpn_mask, segformer_mask):
+    """
+    Compare les masques prédits par FPN et SegFormer avec le masque réel.
+    Retourne un score IoU et une précision pixel par pixel pour chaque modèle.
+
+    Args:
+    real_mask (np.array): Le masque réel de référence
+    fpn_mask (np.array): Le masque prédit par le modèle FPN
+    segformer_mask (np.array): Le masque prédit par le modèle SegFormer
+
+    Returns:
+    dict: Dictionnaire contenant les scores IoU et les précisions pour chaque modèle
+    """
+    
+    assert real_mask.shape == fpn_mask.shape == segformer_mask.shape, "Les masques doivent avoir la même forme"
+    
+    real_flat = real_mask.flatten()
+    fpn_flat = fpn_mask.flatten()
+    segformer_flat = segformer_mask.flatten()
+    
+    # Calcul du score de Jaccard (IoU)
+    iou_fpn = jaccard_score(real_flat, fpn_flat, average='weighted')
+    iou_segformer = jaccard_score(real_flat, segformer_flat, average='weighted')
+    
+    # Calcul de la précision pixel par pixel
+    accuracy_fpn = accuracy_score(real_flat, fpn_flat)
+    accuracy_segformer = accuracy_score(real_flat, segformer_flat)
+    
+    return {
+        'FPN': {'IoU': iou_fpn, 'Precision': accuracy_fpn},
+        'SegFormer': {'IoU': iou_segformer, 'Precision': accuracy_segformer}
+    }
+
+def analyse_mask(real_mask, num_labels):
+    # Compter les occurrences de chaque classe
+    counts = np.bincount(real_mask.ravel(), minlength=num_labels)
+    
+    # Calculer le nombre total de pixels
+    total_pixels = real_mask.size
+    
+    # Calculer les proportions
+    class_proportions = counts / total_pixels
+    
+    # Créer un dictionnaire avec les proportions
+    return dict(enumerate(class_proportions))
+
+def show_eda(image_name):
+    original_image, true_mask = load_and_prepare_images(image_name)
+    class_proportions = analyse_mask(true_mask, num_labels)
+    cityscapes_colormap = create_cityscapes_label_colormap()
+    true_mask_colored = colorize_mask(true_mask)
+    true_mask_colored = Image.fromarray(true_mask_colored.astype('uint8'))
+    true_mask_colored = true_mask_colored.resize((1024,512))
+    
+    # Trier les classes par proportion croissante
+    sorted_classes = sorted(class_proportions.keys(), key=lambda x: class_proportions[x])
+    
+    # Préparer les données pour le barplot
+    categories = [id2label[i] for i in sorted_classes]
+    values = [class_proportions[i] for i in sorted_classes]
+    color_list = [f'rgb({cityscapes_colormap[i][0]}, {cityscapes_colormap[i][1]}, {cityscapes_colormap[i][2]})' for i in sorted_classes]
+    
+    # Distribution des classes avec la colormap personnalisée
+    fig = go.Figure()
+    
+    fig.add_trace(go.Bar(
+        x=categories,
+        y=values,
+        marker_color=color_list,
+        text=[f'{v:.2f}' for v in values],
+        textposition='outside'
+    ))
+
+    # Ajouter un titre et des labels, modifier la rotation et la taille de la police
+    fig.update_layout(
+        title={
+            'text': "Distribution des classes",
+            'font': {'size': 24}
+        },
+        xaxis_title={
+            'text': "Catégories",
+            'font': {'size': 18}
+        },
+        yaxis_title={
+            'text': "Proportion",
+            'font': {'size': 18}
+        },
+        xaxis_tickangle=0,  # Rotation modifiée à -45 degrés
+        uniformtext_minsize=12,
+        uniformtext_mode='hide',
+        font=dict(size=14),
+        autosize=True,
+        bargap=0.2,
+        height=600,  
+        margin=dict(l=20, r=20, t=50, b=20)
+    )
+    
+    return original_image, true_mask_colored, fig
+
+#----Partie Explication GradCam
+
+class SegformerWrapper(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x):
+        output = self.model(x)
+        return output.logits
+    
+class SemanticSegmentationTarget:
+    def __init__(self, category, mask):
+        self.category = category
+        self.mask = torch.from_numpy(mask)
+        if torch.cuda.is_available():
+            self.mask = self.mask.cuda()
+    
+    def __call__(self, model_output):
+        if isinstance(model_output, (dict, transformers.modeling_outputs.SemanticSegmenterOutput)):
+            logits = model_output['logits'] if isinstance(model_output, dict) else model_output.logits
+        elif isinstance(model_output, torch.Tensor):
+            logits = model_output
+        else:
+            raise ValueError(f"Unexpected model_output type: {type(model_output)}")
+        
+        if logits.dim() == 4:  # [batch, classes, height, width]
+            return (logits[0, self.category, :, :] * self.mask).sum()
+        elif logits.dim() == 3:  # [classes, height, width]
+            return (logits[self.category, :, :] * self.mask).sum()
+        else:
+            raise ValueError(f"Unexpected logits shape: {logits.shape}")
+    
+def segformer_reshape_transform_huggingface(tensor, width, height):
+    result = tensor.reshape(tensor.size(0),
+                            height,
+                            width,
+                            tensor.size(2))
+    result = result.transpose(2, 3).transpose(1, 2)
+    return result
+
+
+def explain_model(image_name, category_name):
+    original_image, _ , _= load_and_prepare_images(image_name)
+    rgb_img = np.float32(original_image) / 255
+    img_tensor = transforms.ToTensor()(rgb_img)
+    input_tensor = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                        std=[0.229, 0.224, 0.225])(img_tensor)
+    input_tensor = input_tensor.unsqueeze(0).to(device)
+    wrapped_model = SegformerWrapper(model).to(device)
+    with torch.no_grad():
+        output = wrapped_model(input_tensor)
+        upsampled_logits = nn.functional.interpolate(output, 
+                                                    size=input_tensor.shape[-2:], 
+                                                    mode="bilinear", 
+                                                    align_corners=False)
+    
+    normalized_masks = torch.nn.functional.softmax(upsampled_logits, dim=1).cpu()
+    category = label2id[category_name]
+    mask = normalized_masks[0].argmax(dim=0).numpy()
+    mask_float = np.float32(mask == category)
+    reshape_transform = partial(segformer_reshape_transform_huggingface, #réorganise les dimensions du tenseur pour qu'elles correspondent au format attendu par GradCAM.
+                            width=img_tensor.shape[2]//32,
+                            height=img_tensor.shape[1]//32)
+    target_layers = [wrapped_model.model.segformer.encoder.layer_norm[-1]]
+    mask_float_resized = cv2.resize(mask_float, (output.shape[3], output.shape[2]))
+    targets = [SemanticSegmentationTarget(category, mask_float_resized)]
+    cam = GradCAM(model=wrapped_model, target_layers=target_layers,
+                  reshape_transform=reshape_transform)
+    
+    grayscale_cam = cam(input_tensor=input_tensor, targets=targets)
+    threshold = 0.01  # Seuil de 1% de sureté
+    thresholded_cam = grayscale_cam.copy()
+    thresholded_cam[grayscale_cam < threshold] = 0
+    if np.max(thresholded_cam) > 0:
+        thresholded_cam = thresholded_cam / np.max(thresholded_cam)
+    else:
+        thresholded_cam = grayscale_cam[0]
+    resized_cam = cv2.resize(thresholded_cam[0], (input_tensor.shape[3], input_tensor.shape[2]))
+    masked_cam = resized_cam * mask_float
+    if np.max(masked_cam) > 0:
+        cam_image = show_cam_on_image(rgb_img, masked_cam, use_rgb=True)
+    else:
+        cam_image = original_image
+    fig, ax = plt.subplots(figsize=(15, 10))
+    ax.imshow(cam_image)
+    ax.axis('off')
+    ax.set_title(f"Masque de chaleur GradCam pour {category_name}", color='white')
+    margin = 0.02  # Adjust this value to change the size of the margin
+    margin_color = "#0a0f1e"
+    fig.subplots_adjust(left=margin, right=1-margin, top=1-margin, bottom=margin)
+    fig.patch.set_facecolor(margin_color)
+    plt.close()
+
+    return fig
+
+#----Fin Partie Explication GradCam
+
+image_list = [f for f in os.listdir(os.path.join(data_folder, "images")) if f.endswith('.png')]
+category_list = list(id2label.values())
+
+my_theme = gr.Theme.from_hub("YenLai/Superhuman")
+with gr.Blocks(title="Preuve de concept", theme=my_theme) as demo:
+    with gr.Tab("Prédictions"):
+        gr.Markdown("## Comparaison de segmentation d'images Cityscapes")
+        gr.Markdown("Sélectionnez une image pour voir la comparaison entre le masque réel, la prédiction FPN et la prédiction SegFormer.")
+        
+        image_input = gr.Dropdown(choices=image_list, label="Sélectionnez une image")
+        
+        gallery_output = gr.Gallery(
+            label="Résultats de segmentation",
+            show_label=True,
+            elem_id="gallery",
+            columns=[2], 
+            rows=[2], 
+            object_fit="contain",
+            height="512px",
+            min_width="1024px",
+        )
+        
+        image_input.change(
+            fn=process_image,
+            inputs=image_input,
+            outputs=gallery_output
+        )
+    
+    with gr.Tab("Analyse EDA"):
+        gr.Markdown("## Analyse Exploratoire des Données Cityscapes")
+        gr.Markdown("Visualisations de l'analyse exploratoire du dataset Cityscapes.")
+        
+        eda_image_input = gr.Dropdown(choices=image_list, label="Sélectionnez une image pour l'analyse EDA", )
+        
+        with gr.Row():
+            original_image_output = gr.Image(type="pil", label="Image originale")
+            original_mask_output = gr.Image(type="pil", label="Masque original")
+            
+        
+        class_distribution_plot = gr.Plot(label="Distribution des classes")
+        
+        eda_image_input.change(
+            fn=show_eda,
+            inputs=eda_image_input,
+            outputs=[original_image_output, original_mask_output, class_distribution_plot]
+        )
+        
+        
+    with gr.Tab("Explication SegFormer"):
+        gr.Markdown("## Explication du modèle SegFormer")
+        gr.Markdown("Visualisation de l'explication du modèle SegFormer pour l'image et la catégorie sélectionnées.")
+        gr.Markdown("NB: Si l'image s'affiche sans masque, c'est que le modèle ne trouve pas de zones significatives pour une catégorie donnée.")
+        
+        with gr.Row():
+            explain_image_input = gr.Dropdown(choices=image_list, label="Sélectionnez une image")
+            explain_category_input = gr.Dropdown(choices=category_list, label="Sélectionnez une catégorie")
+            
+        explain_button = gr.Button("Expliquer")
+        explain_output = gr.Plot(label="Explication SegFormer", show_label=False, min_width=200)
+        
+        
+        
+        explain_button.click(
+            fn=explain_model,
+            inputs=[explain_image_input, explain_category_input],
+            outputs=explain_output
+        )
+    
 
 # Lancer l'application
-iface.launch()
+demo.launch(favicon_path="static/favicon.ico")
